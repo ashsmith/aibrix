@@ -19,7 +19,7 @@ import functools
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 from urllib.parse import urlparse
 
 from aibrix.logger import init_logger
@@ -29,6 +29,8 @@ logger = init_logger(__name__)
 
 class ArtifactDownloader(ABC):
     """Base class for artifact downloaders."""
+
+    DOWNLOAD_COMPLETE_MARKER = ".download_complete"
 
     @abstractmethod
     async def download(
@@ -53,6 +55,38 @@ class ArtifactDownloader(ABC):
     def _ensure_directory(self, path: str) -> None:
         """Ensure directory exists and is writable."""
         Path(path).mkdir(parents=True, exist_ok=True)
+
+    def _atomic_download(
+        self, destination_file: str, download_fn: Callable[[str], None]
+    ) -> None:
+        """Download to a .part temp file, then atomically rename to final path.
+
+        Args:
+            destination_file: Final file path
+            download_fn: Callable that accepts a file path and downloads to it
+        """
+        part_file = destination_file + ".part"
+        try:
+            download_fn(part_file)
+            os.replace(part_file, destination_file)
+        except BaseException:
+            if os.path.exists(part_file):
+                os.remove(part_file)
+            raise
+
+    def _write_completion_marker(self, local_path: str) -> None:
+        """Write a marker file indicating the download completed successfully."""
+        marker_path = os.path.join(local_path, self.DOWNLOAD_COMPLETE_MARKER)
+        with open(marker_path, "w") as f:
+            f.write("")
+
+    @staticmethod
+    def is_download_complete(local_path: str) -> bool:
+        """Check whether a previous download to local_path completed successfully."""
+        marker_path = os.path.join(
+            local_path, ArtifactDownloader.DOWNLOAD_COMPLETE_MARKER
+        )
+        return os.path.isfile(marker_path)
 
 
 class S3ArtifactDownloader(ArtifactDownloader):
@@ -130,9 +164,13 @@ class S3ArtifactDownloader(ArtifactDownloader):
                 destination_file = os.path.join(
                     local_path, os.path.basename(object_key)
                 )
-                s3_client.download_file(bucket_name, object_key, destination_file)
+                self._atomic_download(
+                    destination_file,
+                    lambda p: s3_client.download_file(bucket_name, object_key, p),
+                )
                 logger.info(f"Downloaded S3 file to {destination_file}")
 
+            self._write_completion_marker(local_path)
             return local_path
 
         except NoCredentialsError:
@@ -170,8 +208,11 @@ class S3ArtifactDownloader(ArtifactDownloader):
                 # Ensure directory exists
                 self._ensure_directory(os.path.dirname(local_file_path))
 
-                # Download file
-                s3_client.download_file(bucket_name, key, local_file_path)
+                # Download file atomically
+                self._atomic_download(
+                    local_file_path,
+                    lambda p, k=key: s3_client.download_file(bucket_name, k, p),
+                )
                 logger.debug(f"Downloaded {key} to {local_file_path}")
 
         logger.info(f"Downloaded S3 directory {prefix} to {local_path}")
@@ -255,8 +296,11 @@ class GCSArtifactDownloader(ArtifactDownloader):
                     # Ensure directory exists
                     self._ensure_directory(os.path.dirname(local_file_path))
 
-                    # Download file
-                    blob.download_to_filename(local_file_path)
+                    # Download file atomically
+                    self._atomic_download(
+                        local_file_path,
+                        lambda p, b=blob: b.download_to_filename(p),
+                    )
                     logger.debug(f"Downloaded {blob.name} to {local_file_path}")
 
                 logger.info(f"Downloaded GCS directory {blob_name} to {local_path}")
@@ -264,9 +308,13 @@ class GCSArtifactDownloader(ArtifactDownloader):
                 # Download single file
                 blob = bucket.blob(blob_name)
                 destination_file = os.path.join(local_path, os.path.basename(blob_name))
-                blob.download_to_filename(destination_file)
+                self._atomic_download(
+                    destination_file,
+                    lambda p: blob.download_to_filename(p),
+                )
                 logger.info(f"Downloaded GCS file to {destination_file}")
 
+            self._write_completion_marker(local_path)
             return local_path
 
         except Exception as e:
@@ -377,6 +425,7 @@ class TOSArtifactDownloader(ArtifactDownloader):
                 os.replace(tmp_file, destination_file)
                 logger.info(f"Downloaded TOS file to {destination_file}")
 
+            self._write_completion_marker(local_path)
             return local_path
 
         except (TosClientError, TosServerError) as e:
@@ -479,6 +528,7 @@ class HuggingFaceArtifactDownloader(ArtifactDownloader):
             )
 
             logger.info(f"Downloaded HuggingFace model to {download_path}")
+            self._write_completion_marker(download_path)
             return download_path
 
         except Exception as e:
@@ -524,6 +574,7 @@ class HTTPArtifactDownloader(ArtifactDownloader):
         filename = os.path.basename(parsed.path) or "downloaded_file"
         destination_file = os.path.join(local_path, filename)
 
+        part_file = destination_file + ".part"
         try:
             async with httpx.AsyncClient(follow_redirects=True) as client:
                 async with client.stream(
@@ -531,15 +582,19 @@ class HTTPArtifactDownloader(ArtifactDownloader):
                 ) as response:
                     response.raise_for_status()
 
-                    # Download file
-                    with open(destination_file, "wb") as f:
+                    # Download to temp file
+                    with open(part_file, "wb") as f:
                         async for chunk in response.aiter_bytes(chunk_size=8192):
                             f.write(chunk)
 
+            os.replace(part_file, destination_file)
+            self._write_completion_marker(local_path)
             logger.info(f"Downloaded HTTP file to {destination_file}")
             return local_path
 
         except httpx.HTTPStatusError as e:
+            if os.path.exists(part_file):
+                os.remove(part_file)
             if e.response.status_code == 404:
                 raise FileNotFoundError(f"HTTP resource not found: {source_url}")
             elif e.response.status_code == 403:
@@ -547,6 +602,8 @@ class HTTPArtifactDownloader(ArtifactDownloader):
             else:
                 raise RuntimeError(f"HTTP download error: {e}")
         except Exception as e:
+            if os.path.exists(part_file):
+                os.remove(part_file)
             raise RuntimeError(f"HTTP download error: {e}")
 
 

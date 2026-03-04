@@ -30,7 +30,7 @@ from aibrix.openapi.protocol import (
     UnloadLoraAdapterRequest,
     UnloadLoraAdapterRuntimeRequest,
 )
-from aibrix.runtime.downloaders import get_downloader
+from aibrix.runtime.downloaders import ArtifactDownloader, get_downloader
 
 logger = init_logger(__name__)
 
@@ -145,11 +145,18 @@ class ArtifactDelegationService:
         local_path = self._get_local_path_for_adapter(lora_name)
 
         # Check if already downloaded
-        if os.path.exists(local_path) and os.listdir(local_path):
-            logger.info(
-                f"Artifact already exists locally for {lora_name} at {local_path}"
-            )
-            return local_path
+        if os.path.exists(local_path):
+            if ArtifactDownloader.is_download_complete(local_path):
+                logger.info(
+                    f"Artifact already exists locally for {lora_name} at {local_path}"
+                )
+                return local_path
+            else:
+                logger.warning(
+                    f"Incomplete download detected for {lora_name} at {local_path}, "
+                    f"removing and re-downloading"
+                )
+                shutil.rmtree(local_path, ignore_errors=True)
 
         logger.info(
             f"Downloading artifact for {lora_name} from {artifact_url} to {local_path}"

@@ -20,13 +20,14 @@ import pytest
 
 import aibrix.runtime.artifact_service as artifact_service_module
 from aibrix.runtime.artifact_service import ArtifactDelegationService
+from aibrix.runtime.downloaders import ArtifactDownloader
 
 
 @pytest.mark.asyncio
 async def test_download_artifact_does_not_block_event_loop(tmp_path, monkeypatch):
     service = ArtifactDelegationService(local_dir=str(tmp_path))
 
-    class FakeDownloader:
+    class FakeDownloader(ArtifactDownloader):
         async def download(
             self, source_url: str, local_path: str, credentials=None
         ) -> str:
@@ -34,6 +35,7 @@ async def test_download_artifact_does_not_block_event_loop(tmp_path, monkeypatch
             await asyncio.to_thread(time.sleep, 0.2)
             with open(os.path.join(local_path, "done"), "w") as f:
                 f.write("1")
+            self._write_completion_marker(local_path)
             return local_path
 
     monkeypatch.setattr(
